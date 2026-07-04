@@ -174,55 +174,113 @@ def _nn_order(centers):
     return order
 
 
-def build_marker_strokes(outline, color, band_width):
-    """Decompose the marker layer into short chisel-tip strokes and order
-    them the way a person colors: region by region (top-down), then PATCH by
-    patch within the region — the hand travels nearest-neighbor between
-    patches, exactly like the pen hops between ink strokes — then stroke by
-    stroke within a patch (parallel diagonal pulls, alternating direction).
+def _tone_partition(colors_all, ys, xs, shape, k=6):
+    """Cluster the marker pixels into tone layers (k-means on RGB, merged
+    when centers are near-identical), then smooth the assignment into clean
+    coherent swaths (argmax of blurred indicators). Returns (partition,
+    cluster_order): partition[y,x] = cluster id or -1; cluster_order = ids
+    light-to-dark, the order an artist lays them (base coat, then shading)."""
+    cols = colors_all[ys, xs].astype(np.float32)
+    rng = np.random.default_rng(7)
+    sample = cols[rng.choice(len(cols), min(30000, len(cols)), replace=False)]
+    centers = sample[rng.choice(len(sample), k, replace=False)]
+    for _ in range(10):
+        d = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(2)
+        lab = d.argmin(1)
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                centers[j] = sample[m].mean(0)
+    # merge near-identical centers
+    keep = []
+    for j in range(k):
+        if all(((centers[j] - centers[i]) ** 2).sum() ** 0.5 > 14 for i in keep):
+            keep.append(j)
+    centers = centers[keep]
+    d = ((cols[:, None, :] - centers[None, :, :]) ** 2).sum(2)
+    lab = d.argmin(1)
+    # smooth each indicator and take argmax -> clean partition of the mask
+    h, w = shape
+    stack = []
+    for j in range(len(centers)):
+        ind = np.zeros((h, w), dtype=np.float32)
+        ind[ys[lab == j], xs[lab == j]] = 1.0
+        stack.append(ndimage.uniform_filter(ind, size=9))
+    partition = np.full((h, w), -1, dtype=np.int8)
+    partition[ys, xs] = np.argmax(np.stack(stack), axis=0)[ys, xs]
+    lum = centers @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    cluster_order = list(np.argsort(-lum))          # light base first, dark passes last
+    return partition, cluster_order
 
-    Two things prevent the sweeping-frontier look: strokes are NARROW (about
-    half the classic band width, so every pull leaves a visible streak with
-    uncolored paper beside it until its neighbor lands), and ordering is
-    patch-local (the colored area grows around wherever the hand is, never
-    as a region-wide advancing edge).
 
-    Returns (strokes, mask, stroke_w): stroke tip paths, the marker mask,
-    and the streak width the chisel disc should match."""
+def build_marker_plan(outline, color, band_width):
+    """Recover the marker's ACTUAL strokes from the color image and plan
+    their replay — no synthetic geometry (bands/patches/grids), because any
+    imposed geometry shows its seams as straight edges.
+
+    The generated marker layer is made of streaky tone swaths (light skin
+    base, darker skin shading, light/dark garment passes…). So: cluster the
+    marker pixels into tone layers; each tone's connected swaths ARE the
+    painted strokes. Trace every swath along its own principal direction —
+    one long pull for narrow streaks, parallel chisel-width lanes pulled
+    back-and-forth for wide fills. Replay tone layers light→dark (base coat
+    first, shading laid visibly ON TOP, like real marker work), and travel
+    nearest-neighbor between swaths within a layer.
+
+    Returns (plan, mask, lane_w): plan = ordered list of components, each
+    {"cluster": id, "strokes": [tip paths], "pixels": (ys, xs)}; mask = the
+    full marker mask; lane_w = chisel width the reveal disc should match."""
     diff = np.abs(color.astype(np.int16) - outline.astype(np.int16)).max(axis=2)
     mask_img = Image.fromarray(((diff > MARKER_DIFF) * 255).astype(np.uint8))
     mask = np.asarray(mask_img.filter(ImageFilter.MedianFilter(5))) > 127
-    labels, n = ndimage.label(mask, structure=np.ones((3, 3)))
-    strokes = []
-    stroke_w = max(10, int(round(band_width * 0.45)))   # streak width
-    if n == 0:
-        return strokes, mask, stroke_w
-    cell = stroke_w * 7                                 # patch size (~7 pulls per patch)
-    vstep = max(4, stroke_w // 3)                       # tip step along a pull
-    tops = ndimage.minimum(np.indices(mask.shape)[0], labels, index=range(1, n + 1))
-    for lab in np.argsort(tops) + 1:                    # regions top-down
-        ys, xs = np.nonzero(labels == lab)
-        cids = (ys // cell).astype(np.int64) * 100000 + (xs // cell)
-        _, inv = np.unique(cids, return_inverse=True)
-        counts = np.bincount(inv)
-        centers = np.stack([np.bincount(inv, ys) / counts, np.bincount(inv, xs) / counts], axis=1)
-        for ci in _nn_order(centers):                   # hand travels patch to patch
-            m = inv == ci
-            py, px = ys[m], xs[m]
-            band = (py + px) // stroke_w
-            for j, b in enumerate(np.unique(band)):
-                s = band == b
-                by, bx = py[s], px[s]
-                buckets = (bx - by) // vstep
+    lane_w = max(10, int(round(band_width * 0.45)))
+    plan = []
+    ys_all, xs_all = np.nonzero(mask)
+    if len(ys_all) == 0:
+        return plan, mask, lane_w
+    partition, cluster_order = _tone_partition(color, ys_all, xs_all, mask.shape)
+    vstep = max(4, lane_w // 3)
+
+    for cl in cluster_order:
+        cmask = partition == cl
+        labels, n = ndimage.label(cmask, structure=np.ones((3, 3)))
+        if n == 0:
+            continue
+        comps = []
+        for lab in range(1, n + 1):
+            cys, cxs = np.nonzero(labels == lab)
+            if len(cys) < 12:                       # speckle: reveal as a tap
+                comps.append({"cluster": cl, "pixels": (cys, cxs),
+                              "strokes": [[(int(cys[0]), int(cxs[0]))]],
+                              "centroid": (float(cys.mean()), float(cxs.mean()))})
+                continue
+            # principal direction of this swath = the direction it was pulled
+            pts = np.stack([cys, cxs], 1).astype(np.float32)
+            c = pts - pts.mean(0)
+            cov = c.T @ c / len(c)
+            evals, evecs = np.linalg.eigh(cov)
+            major, minor = evecs[:, 1], evecs[:, 0]
+            t = c @ major                            # along the pull
+            v = c @ minor                            # across the pull
+            lanes = np.floor((v - v.min()) / lane_w).astype(np.int64)
+            strokes = []
+            for j, ln in enumerate(np.unique(lanes)):
+                m = lanes == ln
+                buckets = np.floor(t[m] / vstep).astype(np.int64)
                 ub = np.unique(buckets)
                 if j % 2:
-                    ub = ub[::-1]                       # alternate pull direction
+                    ub = ub[::-1]                    # back-and-forth pulls
                 path = []
                 for u in ub:
                     q = buckets == u
-                    path.append((int(round(by[q].mean())), int(round(bx[q].mean()))))
+                    path.append((int(round(cys[m][q].mean())), int(round(cxs[m][q].mean()))))
                 strokes.append(path)
-    return strokes, mask, stroke_w
+            comps.append({"cluster": cl, "pixels": (cys, cxs), "strokes": strokes,
+                          "centroid": (float(cys.mean()), float(cxs.mean()))})
+        centers = np.array([cp["centroid"] for cp in comps])
+        for i in _nn_order(centers):                 # hand travel between swaths
+            plan.append(comps[i])
+    return plan, mask, lane_w
 
 
 def frame_counts(total, n_frames):
@@ -273,9 +331,10 @@ def main():
     strokes, dist = trace_strokes(core)
     strokes = order_strokes(strokes)
     total_pts = sum(len(s) for s in strokes)
-    print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · building marker swipes…", flush=True)
-    mk_strokes, mk_mask, stroke_w = build_marker_strokes(outline, color, band)
-    print(f"[animate] {len(mk_strokes):,} marker swipes · rendering…", flush=True)
+    print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · recovering marker strokes…", flush=True)
+    mk_plan, mk_mask, lane_w = build_marker_plan(outline, color, band)
+    n_swipes = sum(len(cp["strokes"]) for cp in mk_plan)
+    print(f"[animate] {len(mk_plan):,} swaths · {n_swipes:,} marker strokes · rendering…", flush=True)
 
     n_ink = max(1, int(round(args.fps * args.ink_seconds)))
     n_pause = int(round(args.fps * args.pause))
@@ -331,30 +390,53 @@ def main():
     for _ in range(max(0, n_pause - n_fade1)):
         emit(canvas)
 
-    # ---- Phase 2: the chisel tip pulls each marker swipe, patch by patch ----
-    chisel = max(6, int(round(stroke_w * 0.75)) + 2)
+    # ---- Phase 2: replay the recovered marker strokes, tone layer by layer ----
+    chisel = max(6, int(round(lane_w * 0.75)) + 2)
     if chisel not in discs:
         yy, xx = np.mgrid[-chisel:chisel + 1, -chisel:chisel + 1]
         m = yy * yy + xx * xx <= chisel * chisel
         discs[chisel] = (yy[m], xx[m])
-    flat_mk = [(y, x) for s in mk_strokes for (y, x) in s]
+    # flatten to tip points tagged with their component; note where each
+    # component ends so its stragglers can settle as the pass finishes
+    flat_mk = []
+    for ci, cp in enumerate(mk_plan):
+        for s in cp["strokes"]:
+            for (y, x) in s:
+                flat_mk.append((y, x, ci))
+    comp_last = {}
+    for i, (_, _, ci) in enumerate(flat_mk):
+        comp_last[ci] = i
+    # partition-restricted reveal: a pass lays only its own tone's pixels,
+    # so darker passes appear ON TOP of the already-laid base
+    comp_of = np.full((h, w), -1, dtype=np.int32)
+    for ci, cp in enumerate(mk_plan):
+        cys, cxs = cp["pixels"]
+        comp_of[cys, cxs] = ci
     revealed_mk = np.zeros((h, w), dtype=bool)
     prev = 0
     for count in frame_counts(len(flat_mk), n_marker):
-        for (y, x) in flat_mk[prev:count]:
+        for i in range(prev, count):
+            y, x, ci = flat_mk[i]
             oy, ox = discs[chisel]
             py, px = np.clip(y + oy, 0, h - 1), np.clip(x + ox, 0, w - 1)
-            sel = mk_mask[py, px] & ~revealed_mk[py, px]
+            sel = (comp_of[py, px] == ci) & ~revealed_mk[py, px]
             if sel.any():
                 sy, sx = py[sel], px[sel]
                 revealed_mk[sy, sx] = True
                 canvas[sy, sx] = color[sy, sx]
+            if i == comp_last[ci]:                  # settle this swath's stragglers
+                cys, cxs = mk_plan[ci]["pixels"]
+                rem = ~revealed_mk[cys, cxs]
+                if rem.any():
+                    ry, rx = cys[rem], cxs[rem]
+                    revealed_mk[ry, rx] = True
+                    canvas[ry, rx] = color[ry, rx]
         prev = count
         if args.no_cursor or count == 0:
             emit(canvas)
         else:
             fr = canvas.copy()
-            cy, cx = flat_mk[count - 1]
+            cy, cx, _ = flat_mk[count - 1]
             tip = color[cy, cx].astype(np.float32)
             # chisel tip: the laid color with a darker rim so it reads against
             # the color it is laying down
