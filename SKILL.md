@@ -21,7 +21,7 @@ For stills only, use **dip-pen-sketch-combo** (pair), **dip-pen-sketch-outline**
 - **[Claude Code](https://claude.com/claude-code)**
 - **The fal.ai MCP server** connected, with credits. Runs **`fal-ai/nano-banana-2/edit`** twice — **~$0.06–0.08 per run** (the animation itself is free, rendered locally).
 - `curl` + ImageMagick (`convert`) for fetching/resizing/whitening.
-- **`python3` with `numpy` + `Pillow`, and `ffmpeg`** for the animation render (`pip install numpy pillow` · `apt install ffmpeg`).
+- **`python3` with `numpy`, `Pillow`, `scipy`, `scikit-image`, and `ffmpeg`** for the animation render (`pip install numpy pillow scipy scikit-image` · `apt install ffmpeg`).
 - Optional free alternative for the generations: the **nanobanana / Gemini MCP** (`gemini_edit_image`), same model family — free tier often 429-exhausted, so fal is the reliable default.
 
 ## Inputs
@@ -101,7 +101,7 @@ Steps 0–6 are the combo flow; Step 7 renders the animation with the **bundled 
      /tmp/${NAME}_anim_outline.jpg /tmp/${NAME}_anim_color.jpg \
      /tmp/${NAME}_dippen_animation.mp4
    ```
-   Defaults: 30fps · 8s pen phase · 0.75s hold on the finished outline · 5s marker phase · 1.5s end hold · 1600px longest side · pen/marker cursor dot. Knobs: `--fps`, `--ink-seconds`, `--marker-seconds`, `--pause`, `--end-hold`, `--max-size`, `--no-cursor`. The script orders ink pixels along connected strokes (depth-first, top of the figure first) and marker pixels in diagonal zigzag bands, so the reveal reads as drawing, not dissolving.
+   Defaults: 30fps · 8s pen phase · 0.75s hold on the finished outline · 5s marker phase · 1.5s end hold · 1600px longest side · pen/marker cursor dot. Knobs: `--fps`, `--ink-seconds`, `--marker-seconds`, `--pause`, `--end-hold`, `--max-size`, `--no-cursor`. The script replays the ink like a human: it skeletonizes the linework, traces it into individual pen strokes (continuing straight through crossings, so intersecting hatch lines replay as separate strokes), orders them by nearest-neighbor pen travel, and moves a tip along each path revealing the stroke's true width. The marker then lays down as discrete diagonal swipes, region by region. Phase transitions crossfade so no pixels pop in a single frame.
 
 8. **Deliver all three.** `Read` the two stills to show the user, verify the MP4 (`ffprobe -v error -show_entries format=duration,size -of default=nw=1 /tmp/${NAME}_dippen_animation.mp4`), report the three paths, and offer tweaks (pacing knobs, rougher ink via Step-5 levels, 4K stills, vertical crop for socials).
 

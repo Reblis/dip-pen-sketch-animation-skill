@@ -29,7 +29,7 @@ The two sketch images come from an AI image-editing model — that part is **not
 - **[Claude Code](https://claude.com/claude-code)**
 - **A connected [fal.ai](https://fal.ai) MCP server with credits.** The skill runs **`fal-ai/nano-banana-2/edit`** — Google's **Nano Banana 2** — twice (base ink sketch, then color-on-top). **Cost ≈ $0.06–0.08 per run.**
 - `curl` and **ImageMagick** (`convert`) for fetching, resizing, and background whitening.
-- **`python3` + `numpy` + `Pillow`, and `ffmpeg`** for the animation (`pip install numpy pillow` · `apt install ffmpeg`).
+- **`python3` + `numpy`, `Pillow`, `scipy`, `scikit-image`, and `ffmpeg`** for the animation (`pip install numpy pillow scipy scikit-image` · `apt install ffmpeg`).
 - *Optional, free:* a connected **nanobanana / Gemini MCP** runs the same model family at no cost — but its free tier is frequently rate-limited, which is why fal.ai is the default path.
 
 ## What you get
@@ -41,7 +41,7 @@ The two sketch images come from an AI image-editing model — that part is **not
 
 ## How the animation works
 
-The bundled `scripts/animate_sketch.py` orders the outline's ink pixels along connected strokes (depth-first, top of the figure first — the way a pen follows a line to its end) and the marker pixels in diagonal zigzag bands (the way a marker fills an area), then streams progressively-revealed frames straight to ffmpeg. No video model, no re-generation: the final frame *is* the color deliverable, bit for bit.
+The bundled `scripts/animate_sketch.py` replays the drawing the way a person would make it. It skeletonizes the ink and traces it into individual pen strokes — continuing in the straightest direction through crossings, so two hatch lines that intersect replay as two separate strokes — then orders them by nearest-neighbor pen travel (the tip finishes a stroke and moves to the closest next one, never teleporting across the page) and reveals each stroke tip-to-tail at its true local width. The marker phase lays color down as discrete overlapping diagonal swipes, region by region, like filling with a chisel-tip marker. Phase transitions crossfade, and frames stream straight to ffmpeg. No video model, no re-generation: the final frame *is* the color deliverable, bit for bit.
 
 ## Inputs
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """animate_sketch.py — turn a matched dip-pen pair (outline + color) into an
-MP4 of the drawing process: the ink appears stroke by stroke like a pen
-drawing it, then the marker color fills in with diagonal sweeps.
+MP4 of the drawing process, replaying the sketch the way a human would draw
+it: a pen tip travels ALONG each ink stroke (skeleton path), revealing the
+stroke's width as it moves; then the marker color is laid down as discrete
+overlapping diagonal swipes, region by region.
 
 Usage:
   python3 animate_sketch.py OUTLINE.jpg COLOR.jpg OUT.mp4 \
@@ -10,24 +12,45 @@ Usage:
 
 The two inputs must be the matched pair the dip-pen-sketch-combo flow
 produces: identical linework, identical pure-white background, identical
-dimensions. Because frames are built by progressively revealing the actual
-pixels of those two images, the animation is deterministic and its final
-frame IS the color image (after any --max-size resize) — nothing is redrawn
-or re-generated, so the video always matches the stills exactly.
+dimensions. Frames reveal the actual pixels of those two images — nothing is
+redrawn — so the animation is deterministic and its final frame IS the color
+image (after any --max-size resize).
 
-Requires: numpy, Pillow, ffmpeg on PATH.
+How the human-drawn look is achieved:
+- The ink is skeletonized (medial axis). Skeleton pixels are traced into
+  strokes by always continuing in the STRAIGHTEST direction through
+  crossings, so two hatching lines that intersect are replayed as two
+  straight pen strokes, not one blob.
+- Strokes are ordered by greedy nearest-neighbor travel from the top of the
+  figure — the pen finishes a stroke and moves to the closest next one, so
+  it works around the drawing like a person instead of teleporting.
+- The tip reveals a disc matched to the stroke's local thickness (medial
+  axis distance + a margin for the anti-aliased fringe), so lines grow
+  tip-to-tail at constant speed.
+- Phase transitions crossfade (~0.3–0.5s) instead of hard-swapping, so
+  sub-threshold pixels never pop in a single frame.
+
+Requires: numpy, Pillow, scipy, scikit-image, and ffmpeg on PATH.
 """
 import argparse
 import subprocess
 import sys
-from collections import deque
 
 import numpy as np
 from PIL import Image, ImageFilter
 
-INK_THRESHOLD = 200     # gray level below which an outline pixel counts as ink
-MARKER_DIFF = 24        # per-channel |color-outline| above which a pixel is marker
-BAND_WIDTH = 48         # diagonal marker stroke width, px (scaled with image)
+try:
+    from scipy import ndimage
+    from skimage.morphology import medial_axis
+except ImportError as e:
+    sys.exit(f"error: missing dependency ({e.name}). Install with: pip install scipy scikit-image")
+
+INK_CORE = 200        # gray level below which a pixel is confident ink
+INK_FRINGE = 248      # gray level below which a pixel belongs to the ink phase (AA fringe)
+MARKER_DIFF = 24      # per-channel |color-outline| above which a pixel is marker
+BAND_WIDTH = 36       # diagonal marker swipe width, px at 1600 (scaled)
+
+NB8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
 
 def load_pair(outline_path, color_path, max_size):
@@ -40,7 +63,7 @@ def load_pair(outline_path, color_path, max_size):
     scale = min(1.0, max_size / max(w, h))
     if scale < 1.0:
         w, h = int(w * scale), int(h * scale)
-    w -= w % 2  # yuv420p needs even dimensions
+    w -= w % 2
     h -= h % 2
     if (w, h) != outline.size:
         outline = outline.resize((w, h), Image.LANCZOS)
@@ -48,88 +71,120 @@ def load_pair(outline_path, color_path, max_size):
     return np.asarray(outline).copy(), np.asarray(color).copy()
 
 
-def order_ink_pixels(outline):
-    """Order ink pixels the way a pen would draw them: connected strokes,
-    top-to-bottom across the figure, each stroke traversed continuously
-    (depth-first, so branches are followed to their end before backtracking).
-    """
-    gray = outline.mean(axis=2)
-    mask = gray < INK_THRESHOLD
-    h, w = mask.shape
-    visited = np.zeros_like(mask, dtype=bool)
-    components = []
-    neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+def trace_strokes(core):
+    """Skeletonize the ink and trace it into strokes (polylines of skeleton
+    points with local radii). At junctions the tracer continues in the
+    straightest direction, so crossing lines replay as separate strokes."""
+    skel, dist = medial_axis(core, return_distance=True)
+    h, w = skel.shape
+    sk = skel.copy()
 
-    ys_all, xs_all = np.nonzero(mask)
-    # Iterate seeds in scan order so component discovery is top-to-bottom.
-    for y0, x0 in zip(ys_all, xs_all):
-        if visited[y0, x0]:
-            continue
-        # Depth-first walk = pen following one branch to its end, then the next.
-        stack = [(y0, x0)]
+    # Degree map (8-connectivity neighbour count on the skeleton).
+    k = np.ones((3, 3), dtype=np.uint8)
+    deg = ndimage.convolve(skel.astype(np.uint8), k, mode="constant") - skel.astype(np.uint8)
+
+    visited = np.zeros_like(sk, dtype=bool)
+
+    def neighbors(y, x):
+        for dy, dx in NB8:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and sk[ny, nx] and not visited[ny, nx]:
+                yield ny, nx
+
+    def walk(y0, x0):
+        path = [(y0, x0)]
         visited[y0, x0] = True
-        path = []
-        while stack:
-            y, x = stack.pop()
-            path.append((y, x))
-            for dy, dx in neighbors:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
-                    visited[ny, nx] = True
-                    stack.append((ny, nx))
-        components.append(path)
+        while True:
+            cands = list(neighbors(*path[-1]))
+            if not cands:
+                break
+            if len(path) >= 3:
+                (py, px), (cy, cx) = path[-3], path[-1]
+                dy, dx = cy - py, cx - px
+                n = max(1e-6, (dy * dy + dx * dx) ** 0.5)
+                dy, dx = dy / n, dx / n
+                # straightest continuation through crossings
+                cands.sort(key=lambda p: -((p[0] - cy) * dy + (p[1] - cx) * dx))
+            ny, nx = cands[0]
+            visited[ny, nx] = True
+            path.append((ny, nx))
+        return path
 
-    ordered = [p for comp in components for p in comp]
-    ys = np.fromiter((p[0] for p in ordered), dtype=np.int32, count=len(ordered))
-    xs = np.fromiter((p[1] for p in ordered), dtype=np.int32, count=len(ordered))
-    return ys, xs
+    strokes = []
+    ys, xs = np.nonzero(sk & (deg == 1))          # endpoints first: natural stroke starts
+    for y, x in zip(ys, xs):
+        if not visited[y, x]:
+            strokes.append(walk(y, x))
+    ys, xs = np.nonzero(sk)                        # leftovers: loops / dots
+    for y, x in zip(ys, xs):
+        if not visited[y, x]:
+            strokes.append(walk(y, x))
+    return strokes, dist
+
+
+def order_strokes(strokes):
+    """Greedy nearest-neighbor travel starting from the topmost stroke, so
+    the pen moves to the closest next stroke instead of teleporting."""
+    if not strokes:
+        return []
+    remaining = list(range(len(strokes)))
+    starts = np.array([s[0] for s in strokes], dtype=np.float64)
+    ends = np.array([s[-1] for s in strokes], dtype=np.float64)
+    order = []
+    cur = min(remaining, key=lambda i: (strokes[i][0][0], strokes[i][0][1]))
+    pos = np.array(strokes[cur][-1], dtype=np.float64)
+    order.append((cur, False))
+    remaining.remove(cur)
+    rem = np.array(remaining, dtype=np.intp)
+    while rem.size:
+        d_start = ((starts[rem] - pos) ** 2).sum(1)
+        d_end = ((ends[rem] - pos) ** 2).sum(1)
+        best = int(np.argmin(np.minimum(d_start, d_end)))
+        idx = int(rem[best])
+        flip = d_end[best] < d_start[best]
+        order.append((idx, bool(flip)))
+        pos = np.array(strokes[idx][0] if flip else strokes[idx][-1], dtype=np.float64)
+        rem = np.delete(rem, best)
+    return [(strokes[i][::-1] if flip else strokes[i]) for i, flip in order]
+
+
+def disc_offsets(max_r=12):
+    table = {}
+    for r in range(1, max_r + 1):
+        yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+        m = yy * yy + xx * xx <= r * r
+        table[r] = (yy[m], xx[m])
+    return table
 
 
 def order_marker_pixels(outline, color, band_width):
-    """Order marker pixels like marker strokes: region by region (top-left
-    regions first), each region filled in diagonal zigzag bands."""
+    """Group marker pixels into regions (top-down) and diagonal swipe bands
+    within each region; each band is one marker swipe with a moving edge."""
     diff = np.abs(color.astype(np.int16) - outline.astype(np.int16)).max(axis=2)
     mask_img = Image.fromarray(((diff > MARKER_DIFF) * 255).astype(np.uint8))
     mask = np.asarray(mask_img.filter(ImageFilter.MedianFilter(5))) > 127
-    h, w = mask.shape
-    labels = np.full((h, w), -1, dtype=np.int32)
-    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    region_order = []
-
-    ys_all, xs_all = np.nonzero(mask)
-    for y0, x0 in zip(ys_all, xs_all):
-        if labels[y0, x0] != -1:
-            continue
-        rid = len(region_order)
-        labels[y0, x0] = rid
-        q = deque([(y0, x0)])
-        while q:
-            y, x = q.popleft()
-            for dy, dx in neighbors:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and labels[ny, nx] == -1:
-                    labels[ny, nx] = rid
-                    q.append((ny, nx))
-        region_order.append(rid)
-
+    labels, n = ndimage.label(mask, structure=np.ones((3, 3)))
+    if n == 0:
+        return np.empty(0, np.int32), np.empty(0, np.int32)
+    # order regions top-down by their topmost pixel
+    tops = ndimage.minimum(np.indices(mask.shape)[0], labels, index=range(1, n + 1))
+    region_rank = np.argsort(np.argsort(tops))  # rank per label-1
     ys, xs = np.nonzero(mask)
-    lab = labels[ys, xs]
+    lab = labels[ys, xs] - 1
+    rank = region_rank[lab]
     band = (ys + xs) // band_width
-    # Zigzag: alternate the within-band direction so the "marker" sweeps
-    # back and forth instead of jumping.
-    within = np.where(band % 2 == 0, xs - ys, -(xs - ys))
-    order = np.lexsort((within, band, lab))
+    within = np.where(band % 2 == 0, xs - ys, -(xs - ys))   # zigzag swipes
+    order = np.lexsort((within, band, rank))
     return ys[order].astype(np.int32), xs[order].astype(np.int32)
 
 
-def frame_counts(total_pixels, n_frames):
-    """Cumulative pixel counts per frame with a gentle ease-out."""
-    if n_frames <= 0 or total_pixels == 0:
+def frame_counts(total, n_frames):
+    if n_frames <= 0 or total == 0:
         return []
     t = np.linspace(0.0, 1.0, n_frames)
-    eased = 1.0 - (1.0 - t) ** 1.6
-    counts = np.round(eased * total_pixels).astype(np.int64)
-    counts[-1] = total_pixels
+    eased = t + (t * (1 - t)) * 0.2               # nearly linear, slight ease
+    counts = np.round(eased / eased[-1] * total).astype(np.int64)
+    counts[-1] = total
     return counts
 
 
@@ -161,18 +216,26 @@ def main():
     scale = max(h, w) / 1600.0
     pen_radius = max(3, int(round(4 * scale)))
     marker_radius = max(7, int(round(10 * scale)))
-    band = max(24, int(round(BAND_WIDTH * scale)))
+    band = max(20, int(round(BAND_WIDTH * scale)))
 
-    print(f"[animate] {w}x{h} · ordering ink strokes…", flush=True)
-    ink_ys, ink_xs = order_ink_pixels(outline)
-    print(f"[animate] {len(ink_ys):,} ink px · ordering marker strokes…", flush=True)
+    gray = outline.mean(axis=2)
+    fringe = gray < INK_FRINGE
+    core = gray < INK_CORE
+
+    print(f"[animate] {w}x{h} · skeletonizing + tracing strokes…", flush=True)
+    strokes, dist = trace_strokes(core)
+    strokes = order_strokes(strokes)
+    total_pts = sum(len(s) for s in strokes)
+    print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · ordering marker swipes…", flush=True)
     mk_ys, mk_xs = order_marker_pixels(outline, color, band)
     print(f"[animate] {len(mk_ys):,} marker px · rendering…", flush=True)
 
     n_ink = max(1, int(round(args.fps * args.ink_seconds)))
     n_pause = int(round(args.fps * args.pause))
     n_marker = max(1, int(round(args.fps * args.marker_seconds)))
-    n_hold = int(round(args.fps * args.end_hold))
+    n_hold = max(1, int(round(args.fps * args.end_hold)))
+    n_fade1 = min(max(2, int(round(args.fps * 0.3))), max(2, n_pause))
+    n_fade2 = max(2, int(round(args.fps * 0.5)))
 
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -185,28 +248,43 @@ def main():
     def emit(frame):
         ff.stdin.write(frame.tobytes())
 
-    canvas = np.full_like(outline, 255)
+    def crossfade(canvas, target, n):
+        for i in range(1, n + 1):
+            a = i / n
+            emit((canvas.astype(np.float32) * (1 - a) + target.astype(np.float32) * a).astype(np.uint8))
+        return target.copy()
 
-    # Phase 1 — pen: reveal ink pixels along the stroke order.
+    canvas = np.full_like(outline, 255)
+    discs = disc_offsets()
+    revealed = np.zeros((h, w), dtype=bool)
+
+    # ---- Phase 1: pen replays each stroke tip-to-tail ----
+    flat = [(y, x, int(min(12, max(2, round(dist[y, x] + 1.5))))) for s in strokes for (y, x) in s]
     prev = 0
-    for count in frame_counts(len(ink_ys), n_ink):
-        ys, xs = ink_ys[prev:count], ink_xs[prev:count]
-        canvas[ys, xs] = outline[ys, xs]
+    for count in frame_counts(len(flat), n_ink):
+        for (y, x, r) in flat[prev:count]:
+            oy, ox = discs[r]
+            py, px = np.clip(y + oy, 0, h - 1), np.clip(x + ox, 0, w - 1)
+            sel = fringe[py, px] & ~revealed[py, px]
+            if sel.any():
+                sy, sx = py[sel], px[sel]
+                revealed[sy, sx] = True
+                canvas[sy, sx] = outline[sy, sx]
         prev = count
         if args.no_cursor or count == 0:
             emit(canvas)
         else:
             fr = canvas.copy()
-            cy, cx = int(ink_ys[count - 1]), int(ink_xs[count - 1])
+            cy, cx, _ = flat[count - 1]
             draw_cursor(fr, cy, cx, pen_radius, np.array([20, 20, 20], dtype=np.uint8))
             emit(fr)
 
-    # Pause on the finished outline.
-    canvas = outline.copy()
-    for _ in range(n_pause):
+    # settle onto the exact outline (covers residue smoothly), then pause
+    canvas = crossfade(canvas, outline, n_fade1)
+    for _ in range(max(0, n_pause - n_fade1)):
         emit(canvas)
 
-    # Phase 2 — marker: reveal color pixels in diagonal strokes over the outline.
+    # ---- Phase 2: marker swipes, region by region ----
     prev = 0
     for count in frame_counts(len(mk_ys), n_marker):
         ys, xs = mk_ys[prev:count], mk_xs[prev:count]
@@ -220,16 +298,16 @@ def main():
             draw_cursor(fr, cy, cx, marker_radius, color[cy, cx])
             emit(fr)
 
-    # End: the exact color image, held.
-    canvas = color.copy()
-    for _ in range(max(1, n_hold)):
+    # settle onto the exact color image, then hold
+    canvas = crossfade(canvas, color, n_fade2)
+    for _ in range(max(0, n_hold - 1)):
         emit(canvas)
 
     ff.stdin.close()
     if ff.wait() != 0:
         sys.exit("error: ffmpeg failed")
-    total = (n_ink + n_pause + n_marker + max(1, n_hold)) / args.fps
-    print(f"[animate] wrote {args.output} · {total:.1f}s @ {args.fps}fps")
+    total = (n_ink + max(n_pause, n_fade1) + n_marker + n_fade2 + max(0, n_hold - 1)) / args.fps
+    print(f"[animate] wrote {args.output} · ~{total:.1f}s @ {args.fps}fps")
 
 
 if __name__ == "__main__":
