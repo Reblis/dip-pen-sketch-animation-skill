@@ -157,38 +157,72 @@ def disc_offsets(max_r=12):
     return table
 
 
+def _nn_order(centers):
+    """Greedy nearest-neighbor visiting order over points, from the topmost."""
+    rem = list(range(len(centers)))
+    cur = min(rem, key=lambda i: (centers[i][0], centers[i][1]))
+    order = [cur]
+    rem.remove(cur)
+    pos = centers[cur]
+    while rem:
+        arr = np.array(rem)
+        d = ((centers[arr] - pos) ** 2).sum(1)
+        k = int(arr[int(np.argmin(d))])
+        order.append(k)
+        rem.remove(k)
+        pos = centers[k]
+    return order
+
+
 def build_marker_strokes(outline, color, band_width):
-    """Decompose the marker layer into chisel-tip STROKES, the way the ink is
-    decomposed into pen strokes: regions top-down; within a region, one
-    stroke per diagonal band — the tip travels the band's centerline
-    (alternating direction, like scrubbing back and forth) and lays the
-    color down around itself as it moves. Returns (strokes, mask) where each
-    stroke is a list of (y, x) tip positions spaced ~band_width/4 apart."""
+    """Decompose the marker layer into short chisel-tip strokes and order
+    them the way a person colors: region by region (top-down), then PATCH by
+    patch within the region — the hand travels nearest-neighbor between
+    patches, exactly like the pen hops between ink strokes — then stroke by
+    stroke within a patch (parallel diagonal pulls, alternating direction).
+
+    Two things prevent the sweeping-frontier look: strokes are NARROW (about
+    half the classic band width, so every pull leaves a visible streak with
+    uncolored paper beside it until its neighbor lands), and ordering is
+    patch-local (the colored area grows around wherever the hand is, never
+    as a region-wide advancing edge).
+
+    Returns (strokes, mask, stroke_w): stroke tip paths, the marker mask,
+    and the streak width the chisel disc should match."""
     diff = np.abs(color.astype(np.int16) - outline.astype(np.int16)).max(axis=2)
     mask_img = Image.fromarray(((diff > MARKER_DIFF) * 255).astype(np.uint8))
     mask = np.asarray(mask_img.filter(ImageFilter.MedianFilter(5))) > 127
     labels, n = ndimage.label(mask, structure=np.ones((3, 3)))
     strokes = []
+    stroke_w = max(10, int(round(band_width * 0.45)))   # streak width
     if n == 0:
-        return strokes, mask
+        return strokes, mask, stroke_w
+    cell = stroke_w * 7                                 # patch size (~7 pulls per patch)
+    vstep = max(4, stroke_w // 3)                       # tip step along a pull
     tops = ndimage.minimum(np.indices(mask.shape)[0], labels, index=range(1, n + 1))
-    step = max(4, band_width // 4)
-    for lab in np.argsort(tops) + 1:               # regions top-down
+    for lab in np.argsort(tops) + 1:                    # regions top-down
         ys, xs = np.nonzero(labels == lab)
-        band = (ys + xs) // band_width
-        for b in np.unique(band):
-            sel = band == b
-            by, bx = ys[sel], xs[sel]
-            buckets = (bx - by) // step            # position along the band
-            ubuckets = np.unique(buckets)
-            if b % 2:
-                ubuckets = ubuckets[::-1]          # zigzag: alternate pull direction
-            path = []
-            for ub in ubuckets:
-                m = buckets == ub
-                path.append((int(round(by[m].mean())), int(round(bx[m].mean()))))
-            strokes.append(path)
-    return strokes, mask
+        cids = (ys // cell).astype(np.int64) * 100000 + (xs // cell)
+        _, inv = np.unique(cids, return_inverse=True)
+        counts = np.bincount(inv)
+        centers = np.stack([np.bincount(inv, ys) / counts, np.bincount(inv, xs) / counts], axis=1)
+        for ci in _nn_order(centers):                   # hand travels patch to patch
+            m = inv == ci
+            py, px = ys[m], xs[m]
+            band = (py + px) // stroke_w
+            for j, b in enumerate(np.unique(band)):
+                s = band == b
+                by, bx = py[s], px[s]
+                buckets = (bx - by) // vstep
+                ub = np.unique(buckets)
+                if j % 2:
+                    ub = ub[::-1]                       # alternate pull direction
+                path = []
+                for u in ub:
+                    q = buckets == u
+                    path.append((int(round(by[q].mean())), int(round(bx[q].mean()))))
+                strokes.append(path)
+    return strokes, mask, stroke_w
 
 
 def frame_counts(total, n_frames):
@@ -240,7 +274,7 @@ def main():
     strokes = order_strokes(strokes)
     total_pts = sum(len(s) for s in strokes)
     print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · building marker swipes…", flush=True)
-    mk_strokes, mk_mask = build_marker_strokes(outline, color, band)
+    mk_strokes, mk_mask, stroke_w = build_marker_strokes(outline, color, band)
     print(f"[animate] {len(mk_strokes):,} marker swipes · rendering…", flush=True)
 
     n_ink = max(1, int(round(args.fps * args.ink_seconds)))
@@ -297,8 +331,8 @@ def main():
     for _ in range(max(0, n_pause - n_fade1)):
         emit(canvas)
 
-    # ---- Phase 2: the chisel tip pulls each marker swipe, region by region ----
-    chisel = max(8, int(round(band * 0.7)))
+    # ---- Phase 2: the chisel tip pulls each marker swipe, patch by patch ----
+    chisel = max(6, int(round(stroke_w * 0.75)) + 2)
     if chisel not in discs:
         yy, xx = np.mgrid[-chisel:chisel + 1, -chisel:chisel + 1]
         m = yy * yy + xx * xx <= chisel * chisel
