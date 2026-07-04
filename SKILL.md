@@ -93,6 +93,10 @@ Steps 0–6 are the combo flow; Step 7 renders the animation with the **bundled 
      convert "$f.jpg" -fuzz 12% -fill white -opaque "$bg" "$f.jpg"
    done
    for f in ${NAME}_anim_outline ${NAME}_anim_color; do echo "$f -> $(convert "$f.jpg" -format '%[pixel:p{3,3}]' info:)"; done   # both must read 255,255,255
+   Then sweep the borders for paper-edge smudges the whiten can miss — generations sometimes leave faint gray bands/speckle hugging the corners, and left in they replay as stray marks in the animation. The bundled sweep whites out faint desaturated border junk while protecting ink and marker color that legitimately reach the edge:
+   ```bash
+   python3 "$SKILL_DIR/scripts/clean_paper_edges.py" /tmp/${NAME}_anim_outline.jpg /tmp/${NAME}_anim_color.jpg
+   ```
    ```
 
 7. **Render the animation with the bundled script** (`$SKILL_DIR` = this skill's directory):
