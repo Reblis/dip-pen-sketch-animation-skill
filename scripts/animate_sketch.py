@@ -412,6 +412,22 @@ def main():
     for ci, cp in enumerate(mk_plan):
         cys, cxs = cp["pixels"]
         comp_of[cys, cxs] = ci
+    # Let the marker OVERLAP the ink: the diff-based mask excludes the ink
+    # lines and their fringe (identical in both images), which would leave a
+    # white halo along every stroke until the end crossfade. Assign those
+    # gap pixels to their nearest swath, so the chisel visibly glazes ACROSS
+    # the ink as it passes — the line persists because the color image
+    # already contains it.
+    if mk_plan:
+        grow = ndimage.binary_dilation(mk_mask, structure=np.ones((3, 3)), iterations=6)
+        gap = grow & (comp_of == -1)
+        if gap.any():
+            _, (iy, ix) = ndimage.distance_transform_edt(comp_of == -1, return_indices=True)
+            comp_of[gap] = comp_of[iy[gap], ix[gap]]
+            vi = ndimage.value_indices(comp_of, ignore_value=-1)
+            for ci, cp in enumerate(mk_plan):
+                if ci in vi:
+                    cp["pixels"] = vi[ci]
     revealed_mk = np.zeros((h, w), dtype=bool)
     prev = 0
     for count in frame_counts(len(flat_mk), n_marker):
