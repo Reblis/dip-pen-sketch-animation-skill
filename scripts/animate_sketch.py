@@ -157,25 +157,38 @@ def disc_offsets(max_r=12):
     return table
 
 
-def order_marker_pixels(outline, color, band_width):
-    """Group marker pixels into regions (top-down) and diagonal swipe bands
-    within each region; each band is one marker swipe with a moving edge."""
+def build_marker_strokes(outline, color, band_width):
+    """Decompose the marker layer into chisel-tip STROKES, the way the ink is
+    decomposed into pen strokes: regions top-down; within a region, one
+    stroke per diagonal band — the tip travels the band's centerline
+    (alternating direction, like scrubbing back and forth) and lays the
+    color down around itself as it moves. Returns (strokes, mask) where each
+    stroke is a list of (y, x) tip positions spaced ~band_width/4 apart."""
     diff = np.abs(color.astype(np.int16) - outline.astype(np.int16)).max(axis=2)
     mask_img = Image.fromarray(((diff > MARKER_DIFF) * 255).astype(np.uint8))
     mask = np.asarray(mask_img.filter(ImageFilter.MedianFilter(5))) > 127
     labels, n = ndimage.label(mask, structure=np.ones((3, 3)))
+    strokes = []
     if n == 0:
-        return np.empty(0, np.int32), np.empty(0, np.int32)
-    # order regions top-down by their topmost pixel
+        return strokes, mask
     tops = ndimage.minimum(np.indices(mask.shape)[0], labels, index=range(1, n + 1))
-    region_rank = np.argsort(np.argsort(tops))  # rank per label-1
-    ys, xs = np.nonzero(mask)
-    lab = labels[ys, xs] - 1
-    rank = region_rank[lab]
-    band = (ys + xs) // band_width
-    within = np.where(band % 2 == 0, xs - ys, -(xs - ys))   # zigzag swipes
-    order = np.lexsort((within, band, rank))
-    return ys[order].astype(np.int32), xs[order].astype(np.int32)
+    step = max(4, band_width // 4)
+    for lab in np.argsort(tops) + 1:               # regions top-down
+        ys, xs = np.nonzero(labels == lab)
+        band = (ys + xs) // band_width
+        for b in np.unique(band):
+            sel = band == b
+            by, bx = ys[sel], xs[sel]
+            buckets = (bx - by) // step            # position along the band
+            ubuckets = np.unique(buckets)
+            if b % 2:
+                ubuckets = ubuckets[::-1]          # zigzag: alternate pull direction
+            path = []
+            for ub in ubuckets:
+                m = buckets == ub
+                path.append((int(round(by[m].mean())), int(round(bx[m].mean()))))
+            strokes.append(path)
+    return strokes, mask
 
 
 def frame_counts(total, n_frames):
@@ -226,9 +239,9 @@ def main():
     strokes, dist = trace_strokes(core)
     strokes = order_strokes(strokes)
     total_pts = sum(len(s) for s in strokes)
-    print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · ordering marker swipes…", flush=True)
-    mk_ys, mk_xs = order_marker_pixels(outline, color, band)
-    print(f"[animate] {len(mk_ys):,} marker px · rendering…", flush=True)
+    print(f"[animate] {len(strokes):,} strokes · {total_pts:,} skeleton px · building marker swipes…", flush=True)
+    mk_strokes, mk_mask = build_marker_strokes(outline, color, band)
+    print(f"[animate] {len(mk_strokes):,} marker swipes · rendering…", flush=True)
 
     n_ink = max(1, int(round(args.fps * args.ink_seconds)))
     n_pause = int(round(args.fps * args.pause))
@@ -284,18 +297,35 @@ def main():
     for _ in range(max(0, n_pause - n_fade1)):
         emit(canvas)
 
-    # ---- Phase 2: marker swipes, region by region ----
+    # ---- Phase 2: the chisel tip pulls each marker swipe, region by region ----
+    chisel = max(8, int(round(band * 0.7)))
+    if chisel not in discs:
+        yy, xx = np.mgrid[-chisel:chisel + 1, -chisel:chisel + 1]
+        m = yy * yy + xx * xx <= chisel * chisel
+        discs[chisel] = (yy[m], xx[m])
+    flat_mk = [(y, x) for s in mk_strokes for (y, x) in s]
+    revealed_mk = np.zeros((h, w), dtype=bool)
     prev = 0
-    for count in frame_counts(len(mk_ys), n_marker):
-        ys, xs = mk_ys[prev:count], mk_xs[prev:count]
-        canvas[ys, xs] = color[ys, xs]
+    for count in frame_counts(len(flat_mk), n_marker):
+        for (y, x) in flat_mk[prev:count]:
+            oy, ox = discs[chisel]
+            py, px = np.clip(y + oy, 0, h - 1), np.clip(x + ox, 0, w - 1)
+            sel = mk_mask[py, px] & ~revealed_mk[py, px]
+            if sel.any():
+                sy, sx = py[sel], px[sel]
+                revealed_mk[sy, sx] = True
+                canvas[sy, sx] = color[sy, sx]
         prev = count
         if args.no_cursor or count == 0:
             emit(canvas)
         else:
             fr = canvas.copy()
-            cy, cx = int(mk_ys[count - 1]), int(mk_xs[count - 1])
-            draw_cursor(fr, cy, cx, marker_radius, color[cy, cx])
+            cy, cx = flat_mk[count - 1]
+            tip = color[cy, cx].astype(np.float32)
+            # chisel tip: the laid color with a darker rim so it reads against
+            # the color it is laying down
+            draw_cursor(fr, cy, cx, marker_radius, (tip * 0.55).astype(np.uint8))
+            draw_cursor(fr, cy, cx, max(2, marker_radius - 3), tip.astype(np.uint8))
             emit(fr)
 
     # settle onto the exact color image, then hold
