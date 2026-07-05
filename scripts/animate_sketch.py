@@ -33,6 +33,7 @@ How the human-drawn look is achieved:
 Requires: numpy, Pillow, scipy, scikit-image, and ffmpeg on PATH.
 """
 import argparse
+import os
 import subprocess
 import sys
 
@@ -470,6 +471,19 @@ def main():
         sys.exit("error: ffmpeg failed")
     total = (n_ink + max(n_pause, n_fade1) + n_marker + n_fade2 + max(0, n_hold - 1)) / args.fps
     print(f"[animate] wrote {args.output} · ~{total:.1f}s @ {args.fps}fps")
+
+    # Self-check: the whole design guarantees the animation ENDS on the color
+    # deliverable — verify it on every run instead of assuming.
+    tmp = args.output + ".lastframe.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.2",
+                    "-i", args.output, "-frames:v", "1", tmp], check=True)
+    last = np.asarray(Image.open(tmp).convert("RGB")).astype(np.int16)
+    os.remove(tmp)
+    d = float(np.abs(last - color.astype(np.int16)).mean())
+    print(f"[animate] self-check: final frame vs color still diff {d:.2f} "
+          f"({'OK — codec noise only' if d < 3 else 'MISMATCH'})")
+    if d >= 3:
+        sys.exit("error: animation does not end on the color deliverable")
 
 
 if __name__ == "__main__":
