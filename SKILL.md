@@ -97,7 +97,7 @@ Steps 0–6 are the combo flow; Step 7 renders the animation with the **bundled 
    ```bash
    python3 "$SKILL_DIR/scripts/clean_paper_edges.py" /tmp/${NAME}_anim_outline.jpg /tmp/${NAME}_anim_color.jpg
    ```
-   ```
+   ⚠️ Two gotchas field-tested 2026-07: (a) if the sampled corner pixel isn't near-white (artwork reaches that corner), sample a pixel that IS blank paper (e.g. top-center) — flooding from a dark sample eats ink/marker; (b) the sweep script deliberately protects DARK components, so near-black paper-edge curls / desk slivers hugging the frame borders survive it. If corner crops show dark edge curves, shave BOTH stills identically before rendering: `for f in ${NAME}_anim_outline ${NAME}_anim_color; do convert "$f.jpg" -shave 45x45 "$f.jpg"; done`
 
 7. **Render the animation with the bundled script** (`$SKILL_DIR` = this skill's directory):
    ```bash
@@ -107,7 +107,7 @@ Steps 0–6 are the combo flow; Step 7 renders the animation with the **bundled 
    ```
    Defaults: 30fps · 8s pen phase · 0.75s hold on the finished outline · 5s marker phase · 1.5s end hold · 1600px longest side · pen/marker cursor dot. Knobs: `--fps`, `--ink-seconds`, `--marker-seconds`, `--pause`, `--end-hold`, `--max-size`, `--no-cursor`. The script replays BOTH phases from the image's own marks — never synthetic geometry (bands/patches show their seams as straight edges). Ink: skeletonize the linework, trace it into individual pen strokes (continuing straight through crossings, so intersecting hatch lines replay as separate strokes), order by nearest-neighbor pen travel, move a tip along each path revealing the stroke's true width. Marker: recover the ACTUAL painted strokes — cluster marker pixels into tone layers, each tone's connected swaths are the strokes as painted; trace each along its own principal direction and replay light base tones first, darker shading passes visibly on top, traveling nearest-neighbor between swaths. Phase transitions crossfade so no pixels pop in a single frame.
 
-8. **Deliver all three.** `Read` the two stills to show the user, check the script's printed **self-check line** (it extracts the MP4's final frame and asserts it equals the color still — codec noise only; the run FAILS if not), confirm duration/size with `ffprobe -v error -show_entries format=duration,size -of default=nw=1 /tmp/${NAME}_dippen_animation.mp4`, report the three paths, and offer tweaks (pacing knobs, rougher ink via Step-5 levels, 4K stills, vertical crop for socials). Tweak re-renders are free — the generations are the only paid step.
+8. **Deliver all three to the sketches folder** — finals never stay in `/tmp`; `/tmp` is for intermediates only. Default folder `/root/projects/dip-pen-sketches/sketches/` (create it if missing, adapt per install): `cp /tmp/${NAME}_anim_outline.jpg /tmp/${NAME}_anim_color.jpg /tmp/${NAME}_dippen_animation.mp4 /root/projects/dip-pen-sketches/sketches/`. `Read` the two stills to show the user, check the script's printed **self-check line** (it extracts the MP4's final frame and asserts it equals the color still — codec noise only; the run FAILS if not), confirm duration/size with `ffprobe -v error -show_entries format=duration,size -of default=nw=1 /tmp/${NAME}_dippen_animation.mp4`, report the three sketches-folder paths, and offer tweaks (pacing knobs, rougher ink via Step-5 levels, 4K stills, vertical crop for socials). Tweak re-renders are free — the generations are the only paid step.
 
 ## OUTLINE prompt (base generation)
 
